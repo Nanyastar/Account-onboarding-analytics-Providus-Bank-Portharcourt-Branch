@@ -1,0 +1,1822 @@
+---
+title: "Account Onboarding Analytics: Understanding Customer Activation and Balance Patterns at Providus Bank (Port Harcourt Branch)"
+author: "Ifunanya Akaegbusi"
+date: today
+format:
+  html:
+    theme: flatly
+    toc: true
+    code-fold: true
+    self-contained: true
+---
+
+# 1. Executive Summary
+
+This study analyses 14,714 bank accounts opened at the Port Harcourt Branch of Providus Bank between January 2024 and April 2026. As a Relationship Manager, understanding what drives account activation, balance accumulation, and dormancy is central to my daily work — from onboarding new customers to managing portfolio health. Using five analytical techniques — Exploratory Data Analysis, Data Visualisation, Hypothesis Testing, Correlation Analysis, and Logistic Regression — this report identifies the key customer and account-level factors that predict whether a newly opened account remains active or becomes dormant. The findings reveal that account type, restriction status, and customer classification are the strongest predictors of account activity, with corporate accounts maintaining significantly higher balances than individual accounts. The central recommendation is a structured 90-day post-onboarding engagement protocol targeting zero-balance savings accounts, which represent the highest dormancy risk in the branch portfolio.
+
+------------------------------------------------------------------------
+
+# 2. Professional Disclosure
+
+**Job Title:** Relationship Manager\
+**Organisation:** Providus Bank — a full-service commercial bank operating across Nigeria, offering retail banking, corporate banking, digital financial services, and trade finance solutions.
+
+**Why these five techniques are operationally relevant to my role:**
+
+**Exploratory Data Analysis (EDA):** As a Relationship Manager, I am responsible for understanding the composition and health of my assigned customer portfolio. EDA allows me to systematically profile customer segments, identify accounts with anomalous balances or missing KYC data, and flag quality issues before they escalate into compliance problems. I routinely need to answer questions such as: how many accounts in my portfolio are truly active, what is the balance distribution across account types, and where are the data gaps?
+
+**Data Visualisation:** Relationship Managers present portfolio performance reports to branch management and senior stakeholders who are not data specialists. Effective visualisation translates raw account data into narratives that support decisions — for example, showing management that a spike in account openings did not translate into proportional balance growth, or that a particular depositor segment is disproportionately going dormant.
+
+**Hypothesis Testing:** Branch targets and strategy are often built on assumptions — for example, that corporate accounts generate higher balances than individual accounts, or that certain account types perform better under specific market conditions. Hypothesis testing gives me a statistically rigorous way to validate or reject these assumptions rather than acting on intuition or anecdote.
+
+**Correlation Analysis:** Understanding which customer attributes correlate with balance growth or dormancy helps me prioritise relationship management effort. If restriction status and dormancy are strongly correlated, I know to investigate PND flags as an early warning indicator and escalate those accounts before they close.
+
+**Logistic Regression:** Predicting which newly opened accounts are at risk of becoming dormant or closed — before it happens — is a core retention challenge. A regression model that quantifies the contribution of each account and customer characteristic to the probability of remaining active gives me an objective basis for targeted engagement, replacing the current reactive approach with a proactive one.
+
+------------------------------------------------------------------------
+
+# 3. Data Collection & Sampling
+
+**Source:** Core banking system (Flexcube/internal MIS) — Port Harcourt Branch, Providus Bank\
+**Collection Method:** System-generated management report extracted from the branch's account management module, covering all accounts opened within the specified period\
+**Sampling Frame:** All accounts opened at the Port Harcourt Branch between 1 January 2024 and 24 April 2026\
+**Sample Size:** 14,714 account records\
+**Time Period:** 28 months (January 2024 – April 2026)\
+**Variables:** 38 variables per record covering account identifiers, balance figures, customer demographics, account classification, status flags, and relationship manager assignments
+
+**Ethical Notes:** All personally identifiable information (PII) has been anonymised prior to analysis and publication. Fields anonymised include: customer names, email addresses, phone numbers, BVN numbers, TIN, NUBAN account numbers, and physical addresses. These have been replaced with anonymised codes. The data was accessed in the ordinary course of professional duties as a Relationship Manager with authorised system access. No customer consent beyond standard banking terms of service is required for internal analytical use of this data. The dataset is not published in its raw form; only anonymised versions are included in this submission.
+
+------------------------------------------------------------------------
+
+# 4. Data Description
+
+## 4.1 Setup — Load Libraries
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(skimr)
+library(corrplot)
+library(ggcorrplot)
+library(naniar)
+library(car)
+library(lmtest)
+library(broom)
+library(pROC)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(reticulate)
+```
+
+## 4.2 Load & Anonymise Data
+
+```{r}
+#| label: load-and-anonymise
+#| message: false
+#| warning: false
+
+# Load raw data
+raw_df <- read_csv("Accounts_Opened_In_a_Branch_Within_A_Period__2_.csv",
+                   show_col_types = FALSE)
+
+# Anonymise all PII columns before any analysis
+set.seed(42)
+n <- nrow(raw_df)
+
+df <- raw_df |>
+  mutate(
+    CUSTOMER_ID  = paste0("CUST_", str_pad(row_number(), 5, pad = "0")),
+    ACCT_REF     = paste0("ACCT_", str_pad(row_number(), 5, pad = "0"))
+  ) |>
+  select(-ACCT_NAME, -E_MAIL, -MOB_NUM, -TELEPHONE1, -TELEPHONE2,
+         -ADDRESS, -SIG_BVN, -CUST_BVN, -DIR_BVN, -TIN,
+         -NUBAN, -BANKS_ACCT, -CUSTOMER_ID1)
+
+cat("Dataset loaded and anonymised.\n")
+cat("Rows:", nrow(df), "| Columns:", ncol(df), "\n")
+```
+
+## 4.3 Fix Data Types & Engineer Variables
+
+```{r}
+#| label: clean-engineer
+#| message: false
+#| warning: false
+
+df <- df |>
+  mutate(
+    # Fix dates
+    DATE_OPENED   = mdy_hms(DATE_OPENED),
+    DATE_OF_BIRTH = mdy_hms(DATE_OF_BIRTH),
+
+    # Clean balance — remove commas, convert to numeric
+    CRNT_BAL      = as.numeric(str_remove_all(CRNT_BAL, ",")),
+
+    # Derive age at time of account opening
+    AGE = as.integer(
+      interval(DATE_OF_BIRTH, DATE_OPENED) / years(1)
+    ),
+
+    # Cap age: remove impossible values (< 0 or > 100)
+    AGE_CLEAN = case_when(
+      AGE < 0   ~ NA_integer_,
+      AGE > 100 ~ NA_integer_,
+      TRUE      ~ AGE
+    ),
+
+    # Account age in days from opening to reference date (2026-04-30)
+    ACCOUNT_AGE_DAYS = as.integer(
+      interval(DATE_OPENED, as.Date("2026-04-30")) / days(1)
+    ),
+
+    # Time features
+    OPEN_YEAR  = year(DATE_OPENED),
+    OPEN_MONTH = month(DATE_OPENED, label = TRUE, abbr = TRUE),
+
+    # Outcome variable: IS_ACTIVE (1 = ACTIVE, 0 = CLOSED or DORMANT)
+    IS_ACTIVE = if_else(ACCOUNTSTATUS == "ACTIVE", 1L, 0L),
+
+    # Restriction flag
+    IS_RESTRICTED = if_else(PND_STATUS == "NONE", 0L, 1L),
+
+    # Has any balance at all
+    HAS_BALANCE = if_else(CRNT_BAL > 0, 1L, 0L),
+
+    # Log-transform balance (add 1 to handle zeros)
+    LOG_BALANCE = log1p(pmax(CRNT_BAL, 0)),
+
+    # Collapse RELIGION missings to "Unknown"
+    RELIGION_CLEAN = if_else(is.na(RELIGION), "Unknown", RELIGION),
+
+    # Collapse rare DEPOSITOR_TYPE categories (keep top 8, rest = "Other")
+    DEPOSITOR_TOP = fct_lump_n(DEPOSITOR_TYPE, n = 8, other_level = "Other"),
+
+    # Collapse rare ACCOUNT_TYPE categories (keep top 5, rest = "Other")
+    ACCT_TYPE_TOP = fct_lump_n(ACCOUNT_TYPE, n = 5, other_level = "Other"),
+
+    # Convert key categoricals to factors
+    ACCOUNTSTATUS = factor(ACCOUNTSTATUS),
+    CUSTOMER_TYPE = factor(CUSTOMER_TYPE),
+    GENDER        = factor(GENDER),
+    SBU           = factor(SBU)
+  )
+
+cat("Variables engineered. Final shape:", nrow(df), "rows x", ncol(df), "columns\n")
+```
+
+## 4.4 Identify & Document Data Quality Issues
+
+```{r}
+#| label: data-quality
+#| message: false
+#| warning: false
+
+# Missing value summary — only columns with any missingness
+miss_summary <- df |>
+  miss_var_summary() |>
+  filter(pct_miss > 0) |>
+  arrange(desc(pct_miss)) |>
+  mutate(pct_miss = round(pct_miss, 2))
+
+miss_summary |>
+  kable(
+    caption = "Table 1: Missing Value Summary (columns with any missingness)",
+    col.names = c("Variable", "Missing (n)", "Missing (%)")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+```{r}
+#| label: quality-issues
+#| message: false
+#| warning: false
+
+# Data Quality Issue 1: Age outliers
+age_issues <- df |>
+  filter(!is.na(AGE)) |>
+  summarise(
+    negative_age = sum(AGE < 0),
+    over_100     = sum(AGE > 100),
+    total_flagged = sum(AGE < 0 | AGE > 100)
+  )
+
+cat("=== DATA QUALITY ISSUE 1: Age Outliers ===\n")
+cat("Negative ages:", age_issues$negative_age, "\n")
+cat("Age > 100:", age_issues$over_100, "\n")
+cat("Total flagged and set to NA:", age_issues$total_flagged, "\n")
+cat("Action taken: Capped — values outside 0–100 set to NA\n\n")
+
+# Data Quality Issue 2: High missingness columns
+cat("=== DATA QUALITY ISSUE 2: High-Missingness Columns ===\n")
+cat("RATE: 99.2% missing — excluded from all analyses\n")
+cat("TELEPHONE2: 92.7% missing — excluded\n")
+cat("AMC: 91.3% missing — excluded\n")
+cat("DIR_BVN: 76.2% missing — excluded (also PII)\n")
+cat("TIN: 75.9% missing — excluded (also PII)\n")
+cat("RELIGION: 62.7% missing — NA recoded as 'Unknown' to preserve observations\n")
+cat("Action: Columns above 75% missingness dropped from modelling; RELIGION retained with Unknown category\n")
+```
+
+## 4.5 Variable Overview
+
+```{r}
+#| label: variable-overview
+#| message: false
+#| warning: false
+
+# Summary of key analysis variables
+df |>
+  select(CRNT_BAL, LOG_BALANCE, AVAILABLE_BALANCE, AGE_CLEAN,
+         ACCOUNT_AGE_DAYS, IS_ACTIVE, IS_RESTRICTED, HAS_BALANCE,
+         CUSTOMER_TYPE, ACCOUNTSTATUS, ACCT_TYPE_TOP, GENDER) |>
+  skim() |>
+  kable(caption = "Table 2: Summary Statistics for Key Analysis Variables") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 12)
+```
+
+------------------------------------------------------------------------
+
+# 5. Exploratory Data Analysis (Technique 1)
+
+## 5.1 Theory Recap
+
+Exploratory Data Analysis (EDA) is the practice of examining datasets to summarise their main characteristics before formal modelling. It encompasses summary statistics, distribution analysis, missing value assessment, and outlier detection. Anscombe's Quartet (1973) famously demonstrated that datasets with identical summary statistics can have radically different distributions — a warning that mean and standard deviation alone are insufficient to understand data. EDA is therefore the mandatory first step before any inferential or predictive work.
+
+## 5.2 Business Justification
+
+As a Relationship Manager at Providus Bank, EDA is operationally equivalent to a portfolio health review. Before recommending any retention strategy or reporting to branch management, I need to know: what is the actual shape of the balance distribution across my accounts? Are there systematic data quality problems — missing KYC fields, impossible ages, zero-balance accounts that were never funded? Which account segments are driving volume versus value? EDA answers these questions rigorously rather than through anecdote.
+
+## 5.3 Distribution of Key Numeric Variables
+
+```{r}
+#| label: eda-numeric
+#| message: false
+#| warning: false
+
+# Balance distribution — raw vs log
+p1 <- ggplot(df, aes(x = CRNT_BAL)) +
+  geom_histogram(bins = 80, fill = "#2C7BB6", colour = "white", alpha = 0.85) +
+  scale_x_continuous(labels = label_comma()) +
+  labs(title = "Raw Current Balance Distribution",
+       subtitle = "Heavily right-skewed — majority of accounts hold near-zero balances",
+       x = "Current Balance (NGN)", y = "Count") +
+  theme_minimal(base_size = 12)
+
+p2 <- ggplot(df |> filter(CRNT_BAL >= 0), aes(x = LOG_BALANCE)) +
+  geom_histogram(bins = 60, fill = "#1A9641", colour = "white", alpha = 0.85) +
+  labs(title = "Log-Transformed Balance Distribution",
+       subtitle = "log1p(CRNT_BAL) — reveals structure hidden by extreme values",
+       x = "log1p(Current Balance)", y = "Count") +
+  theme_minimal(base_size = 12)
+
+p1
+p2
+```
+
+```{r}
+#| label: eda-age
+#| message: false
+#| warning: false
+
+ggplot(df |> filter(!is.na(AGE_CLEAN)), aes(x = AGE_CLEAN)) +
+  geom_histogram(bins = 40, fill = "#D7191C", colour = "white", alpha = 0.85) +
+  labs(title = "Age Distribution of Account Holders",
+       subtitle = "After removing impossible values (age < 0 or > 100) | Corporate accounts excluded (OTHERS gender)",
+       x = "Age (years)", y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+## 5.4 Categorical Variable Distributions
+
+```{r}
+#| label: eda-categoricals
+#| message: false
+#| warning: false
+
+# Account Status
+df |>
+  count(ACCOUNTSTATUS) |>
+  mutate(pct = n / sum(n),
+         label = paste0(n, "\n(", percent(pct, accuracy = 0.1), ")")) |>
+  ggplot(aes(x = fct_reorder(ACCOUNTSTATUS, n), y = n, fill = ACCOUNTSTATUS)) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_text(aes(label = label), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("ACTIVE" = "#1A9641",
+                                "DORMANT" = "#FD8D3C",
+                                "CLOSED" = "#D7191C")) +
+  scale_y_continuous(limits = c(0, 16000)) +
+  labs(title = "Account Status Distribution",
+       subtitle = "93.6% of accounts are ACTIVE — class imbalance noted for regression",
+       x = NULL, y = "Number of Accounts") +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: eda-customer-type
+#| message: false
+#| warning: false
+
+df |>
+  count(CUSTOMER_TYPE, ACCOUNTSTATUS) |>
+  group_by(CUSTOMER_TYPE) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = CUSTOMER_TYPE, y = pct, fill = ACCOUNTSTATUS)) +
+  geom_col(position = "fill", width = 0.55) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("ACTIVE" = "#1A9641",
+                                "DORMANT" = "#FD8D3C",
+                                "CLOSED" = "#D7191C")) +
+  labs(title = "Account Status Breakdown by Customer Type",
+       subtitle = "Corporate accounts show higher dormancy rate (6.3%) vs Individual (1.4%)",
+       x = "Customer Type", y = "Proportion", fill = "Status") +
+  theme_minimal(base_size = 12)
+```
+
+## 5.5 Anscombe's Quartet — Why Summary Stats Alone Are Insufficient
+
+```{r}
+#| label: anscombe
+#| message: false
+#| warning: false
+
+# Demonstrate with balance data across account types
+balance_summary <- df |>
+  filter(ACCT_TYPE_TOP %in% c("PROVIDUS SAVINGS A/C",
+                               "CURR.A/C -LOCAL CORPORATE",
+                               "PROVIDUS CURRENT ACCOUNT")) |>
+  group_by(ACCT_TYPE_TOP) |>
+  summarise(
+    Mean_Balance   = round(mean(CRNT_BAL, na.rm = TRUE), 2),
+    Median_Balance = round(median(CRNT_BAL, na.rm = TRUE), 2),
+    SD_Balance     = round(sd(CRNT_BAL, na.rm = TRUE), 2),
+    N              = n()
+  )
+
+balance_summary |>
+  kable(
+    caption = "Table 3: Summary Statistics by Account Type — Similar means mask very different distributions",
+    col.names = c("Account Type", "Mean Balance (NGN)",
+                  "Median Balance (NGN)", "SD (NGN)", "N")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+#| label: anscombe-visual
+#| message: false
+#| warning: false
+
+# Show the actual distributions to prove the means are misleading
+df |>
+  filter(
+    ACCT_TYPE_TOP %in% c("PROVIDUS SAVINGS A/C",
+                          "CURR.A/C -LOCAL CORPORATE",
+                          "PROVIDUS CURRENT ACCOUNT"),
+    CRNT_BAL >= 0
+  ) |>
+  ggplot(aes(x = LOG_BALANCE, fill = ACCT_TYPE_TOP)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~ACCT_TYPE_TOP, ncol = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Balance Distributions Are Not What the Means Suggest",
+    subtitle = "Echoing Anscombe's Quartet: identical-looking summary stats, radically different shapes",
+    x = "log1p(Current Balance)", y = "Density", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+------------------------------------------------------------------------
+
+# 6. Data Visualisation (Technique 2)
+
+## 6.1 Theory Recap
+
+Data visualisation translates numerical patterns into perceptual signals. The grammar of graphics (Wilkinson, 1999; implemented in ggplot2) frames every chart as a mapping of data variables to aesthetic properties — position, colour, size, shape. Effective chart selection is determined by the question being asked: time trends call for line charts, comparisons call for bar charts, distributions call for histograms or density plots, and relationships call for scatterplots. A visualisation narrative uses a sequence of charts to tell a single coherent story rather than presenting isolated graphics.
+
+## 6.2 Business Justification
+
+Relationship Managers are expected to communicate portfolio insights to branch management, credit committees, and senior stakeholders who do not read regression tables. A well-constructed visualisation narrative compresses analytical findings into a form that drives decisions — making it one of the most practically valuable skills in this role.
+
+## 6.3 The Five-Plot Narrative: "Who Is Opening Accounts, and What Happens to Them?"
+
+### Plot 1 — Monthly Account Opening Trend
+
+```{r}
+#| label: plot1-trend
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 5
+
+df |>
+  mutate(YearMonth = floor_date(DATE_OPENED, "month")) |>
+  count(YearMonth) |>
+  ggplot(aes(x = YearMonth, y = n)) +
+  geom_line(colour = "#2C7BB6", linewidth = 1.1) +
+  geom_point(colour = "#2C7BB6", size = 2.5) +
+  geom_smooth(method = "loess", se = TRUE, colour = "#D7191C",
+              fill = "#D7191C", alpha = 0.15, linewidth = 0.8) +
+  scale_x_datetime(date_breaks = "3 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title = "Plot 1: Monthly Account Openings — Port Harcourt Branch (Jan 2024 – Apr 2026)",
+    subtitle = "Peak onboarding in Jan 2025 (744 accounts); declining trend from mid-2025 onwards",
+    x = NULL, y = "Accounts Opened",
+    caption = "Red band: LOESS trend with 95% confidence interval"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Plot 2 — Account Status by Customer Type
+
+```{r}
+#| label: plot2-status-type
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 5
+
+df |>
+  count(CUSTOMER_TYPE, ACCOUNTSTATUS) |>
+  ggplot(aes(x = CUSTOMER_TYPE, y = n, fill = ACCOUNTSTATUS)) +
+  geom_col(position = "dodge", width = 0.65) +
+  geom_text(aes(label = label_comma()(n)),
+            position = position_dodge(width = 0.65),
+            vjust = -0.4, size = 3.2) +
+  scale_fill_manual(values = c("ACTIVE"  = "#1A9641",
+                                "DORMANT" = "#FD8D3C",
+                                "CLOSED"  = "#D7191C")) +
+  scale_y_continuous(labels = label_comma(), expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Plot 2: Account Status by Customer Type",
+    subtitle = "Corporate accounts have disproportionately more dormant accounts relative to their volume",
+    x = "Customer Type", y = "Number of Accounts", fill = "Status"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Plot 3 — Balance Distribution by Account Type
+
+```{r}
+#| label: plot3-balance
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 6
+
+df |>
+  filter(CRNT_BAL >= 0, ACCT_TYPE_TOP != "Other") |>
+  ggplot(aes(x = ACCT_TYPE_TOP, y = LOG_BALANCE, fill = ACCT_TYPE_TOP)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.8,
+               outlier.alpha = 0.3, fill = "white") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 18)) +
+  labs(
+    title = "Plot 3: Balance Distribution by Account Type (Log Scale)",
+    subtitle = "Corporate current accounts show higher median balances; savings accounts are heavily zero-concentrated",
+    x = "Account Type", y = "log1p(Current Balance)",
+    caption = "Violin shape shows full distribution; white box shows IQR and median"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### Plot 4 — Age Distribution by Account Status
+
+```{r}
+#| label: plot4-age-status
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 5
+
+df |>
+  filter(!is.na(AGE_CLEAN)) |>
+  ggplot(aes(x = AGE_CLEAN, fill = ACCOUNTSTATUS, colour = ACCOUNTSTATUS)) +
+  geom_density(alpha = 0.45, linewidth = 0.8) +
+  scale_fill_manual(values  = c("ACTIVE"  = "#1A9641",
+                                 "DORMANT" = "#FD8D3C",
+                                 "CLOSED"  = "#D7191C")) +
+  scale_colour_manual(values = c("ACTIVE"  = "#1A9641",
+                                  "DORMANT" = "#FD8D3C",
+                                  "CLOSED"  = "#D7191C")) +
+  labs(
+    title = "Plot 4: Age Distribution by Account Status",
+    subtitle = "Closed and dormant accounts skew towards younger customers — potential early-exit risk segment",
+    x = "Customer Age (years)", y = "Density",
+    fill = "Status", colour = "Status"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### Plot 5 — Top Depositor Types by Volume
+
+```{r}
+#| label: plot5-depositor
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 6
+
+df |>
+  count(DEPOSITOR_TYPE, sort = TRUE) |>
+  slice_head(n = 15) |>
+  ggplot(aes(x = n,
+             y = fct_reorder(DEPOSITOR_TYPE, n),
+             fill = n)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = label_comma()(n)), hjust = -0.15, size = 3.3) +
+  scale_fill_gradient(low = "#ABDDA4", high = "#2C7BB6") +
+  scale_x_continuous(labels = label_comma(),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Plot 5: Top 15 Depositor Types by Account Volume",
+    subtitle = "Marketers dominate onboarding (5,965 accounts) — branch relies heavily on agent-driven acquisition",
+    x = "Number of Accounts", y = NULL
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 6.4 Visualisation Narrative — Integrated Interpretation
+
+The five plots tell a connected story. **Plot 1** shows that account opening peaked in January 2025 and has trended downward since mid-2025, suggesting either a slowdown in the branch's acquisition drive or seasonal effects. **Plot 2** reveals that while individual customers account for the bulk of volume, corporate accounts are proportionally more likely to go dormant — a risk concentration the branch should monitor. **Plot 3** confirms that corporate current accounts maintain substantially higher balances than savings accounts, most of which cluster at or near zero — meaning volume growth in savings is not translating into balance growth. **Plot 4** shows that closed and dormant accounts skew younger, identifying customers under 30 as a higher-risk segment for early exit. **Plot 5** exposes a structural acquisition dependency: Marketers account for over 40% of all accounts opened, meaning the branch's portfolio quality is heavily tied to the quality of its marketer-driven onboarding pipeline.
+
+------------------------------------------------------------------------
+
+# 7. Hypothesis Testing (Technique 3)
+
+## 7.1 Theory Recap
+
+Hypothesis testing is a formal framework for making decisions under uncertainty. A null hypothesis (H₀) states that no effect or difference exists; the alternative hypothesis (H₁) proposes that one does. The test produces a p-value — the probability of observing the data if H₀ were true. By convention, p \< 0.05 is taken as sufficient evidence to reject H₀. However, statistical significance alone is insufficient: effect size measures (Cohen's d for continuous outcomes, Cramér's V for categorical associations) quantify the practical magnitude of any difference found. A result can be statistically significant but operationally trivial, particularly with large samples such as this one (n = 14,714).
+
+## 7.2 Business Justification
+
+Branch strategy at Providus Bank is routinely built on untested assumptions — that corporate accounts outperform individual accounts, or that account type determines balance outcomes. Hypothesis testing replaces assumption with evidence. As a Relationship Manager, being able to present a statistically validated finding to management ("corporate accounts hold significantly higher balances, p \< 0.001, and the effect is large") is more persuasive and defensible than presenting an average from a spreadsheet.
+
+------------------------------------------------------------------------
+
+## 7.3 Hypothesis 1 — Do Corporate Accounts Hold Significantly Higher Balances Than Individual Accounts?
+
+**H₀:** The mean current balance is equal for CORPORATE and INDIVIDUAL customers\
+**H₁:** The mean current balance differs between CORPORATE and INDIVIDUAL customers\
+**Test:** Welch's two-sample t-test (does not assume equal variances)\
+**Effect size:** Cohen's d
+
+### Step 1 — Check Normality Assumption
+
+```{r}
+#| label: h1-normality
+#| message: false
+#| warning: false
+
+# Subset the two groups — positive balances only for meaningful comparison
+corp <- df |> filter(CUSTOMER_TYPE == "CORPORATE", CRNT_BAL > 0) |> pull(LOG_BALANCE)
+indv <- df |> filter(CUSTOMER_TYPE == "INDIVIDUAL", CRNT_BAL > 0) |> pull(LOG_BALANCE)
+
+cat("=== NORMALITY CHECK ===\n")
+cat("Corporate accounts with positive balance:", length(corp), "\n")
+cat("Individual accounts with positive balance:", length(indv), "\n\n")
+
+# With n > 5000, Shapiro-Wilk is too sensitive — use visual check + CLT argument
+# Central Limit Theorem: with n > 30, t-test is robust to non-normality
+cat("Sample sizes exceed 30 in both groups.\n")
+cat("By the Central Limit Theorem, the sampling distribution of the mean\n")
+cat("is approximately normal regardless of the population distribution.\n")
+cat("Welch's t-test is appropriate.\n\n")
+
+# Visual check
+par(mfrow = c(1, 2))
+qqnorm(sample(corp, 500), main = "Q-Q Plot: Corporate (sample n=500)")
+qqline(corp, col = "red")
+qqnorm(sample(indv, 500), main = "Q-Q Plot: Individual (sample n=500)")
+qqline(indv, col = "red")
+par(mfrow = c(1, 1))
+```
+
+### Step 2 — Check Equal Variance (Levene's Test)
+
+```{r}
+#| label: h1-levene
+#| message: false
+#| warning: false
+
+balance_subset <- df |>
+  filter(CUSTOMER_TYPE %in% c("CORPORATE", "INDIVIDUAL"), CRNT_BAL > 0) |>
+  select(CUSTOMER_TYPE, LOG_BALANCE)
+
+levene_result <- leveneTest(LOG_BALANCE ~ CUSTOMER_TYPE,
+                             data = balance_subset)
+
+cat("=== LEVENE'S TEST FOR EQUAL VARIANCES ===\n")
+print(levene_result)
+cat("\nInterpretation: If p < 0.05, variances are unequal — use Welch's t-test (var.equal = FALSE)\n")
+```
+
+### Step 3 — Run Welch's t-Test
+
+```{r}
+#| label: h1-ttest
+#| message: false
+#| warning: false
+
+t_result <- t.test(corp, indv, var.equal = FALSE, conf.level = 0.95)
+
+cat("=== WELCH'S TWO-SAMPLE T-TEST ===\n")
+print(t_result)
+```
+
+### Step 4 — Calculate Effect Size (Cohen's d)
+
+```{r}
+#| label: h1-effect
+#| message: false
+#| warning: false
+
+# Cohen's d = (mean1 - mean2) / pooled SD
+pooled_sd <- sqrt((sd(corp)^2 + sd(indv)^2) / 2)
+cohens_d  <- (mean(corp) - mean(indv)) / pooled_sd
+
+cat("=== EFFECT SIZE ===\n")
+cat("Cohen's d:", round(cohens_d, 4), "\n")
+cat("Interpretation:\n")
+cat("  |d| < 0.2  = Negligible\n")
+cat("  |d| < 0.5  = Small\n")
+cat("  |d| < 0.8  = Medium\n")
+cat("  |d| >= 0.8 = Large\n")
+```
+
+### Step 5 — Visualise the Difference
+
+```{r}
+#| label: h1-visual
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 5
+
+df |>
+  filter(CUSTOMER_TYPE %in% c("CORPORATE", "INDIVIDUAL"), CRNT_BAL > 0) |>
+  ggplot(aes(x = CUSTOMER_TYPE, y = LOG_BALANCE, fill = CUSTOMER_TYPE)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.12, fill = "white",
+               outlier.size = 0.6, outlier.alpha = 0.3) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 4, colour = "black") +
+  scale_fill_manual(values = c("CORPORATE" = "#2C7BB6",
+                                "INDIVIDUAL" = "#D7191C")) +
+  labs(
+    title = "Hypothesis 1: Balance Distribution — Corporate vs Individual Accounts",
+    subtitle = "Diamond (◆) = group mean | Welch's t-test result reported in interpretation below",
+    x = "Customer Type", y = "log1p(Current Balance)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+### Step 6 — Plain-Language Business Interpretation
+
+```{r}
+#| label: h1-interpretation
+#| results: asis
+
+cat("**Result:** The Welch's t-test produces a statistically significant result
+(p < 0.05), allowing us to reject H₀. Corporate accounts hold significantly
+higher log-transformed balances than individual accounts at the Port Harcourt Branch.\n\n")
+
+cat("**Effect size:** Cohen's d quantifies the practical magnitude of this
+difference. A medium-to-large effect indicates this is not merely a
+statistical artefact of sample size — the difference is operationally meaningful.\n\n")
+
+cat("**Business implication:** The branch cannot treat all accounts as
+equivalent when setting relationship management priorities. Corporate accounts
+represent a disproportionate share of balance value. A deliberate strategy to
+improve corporate onboarding quality — including faster account activation,
+dedicated relationship manager assignment, and early engagement within the first
+30 days — would have a measurable impact on total branch deposits. Individual
+savings accounts, despite dominating by volume, contribute far less to the
+balance sheet and require a different, more cost-efficient engagement model.")
+```
+
+------------------------------------------------------------------------
+
+## 7.4 Hypothesis 2 — Is Account Status Associated with Account Type?
+
+**H₀:** Account status (ACTIVE / CLOSED / DORMANT) is independent of account type\
+**H₁:** Account status and account type are statistically associated\
+**Test:** Chi-squared test of independence\
+**Effect size:** Cramér's V
+
+### Step 1 — Build the Contingency Table
+
+```{r}
+#| label: h2-table
+#| message: false
+#| warning: false
+
+# Use top account types only to ensure adequate cell counts
+h2_data <- df |>
+  filter(ACCT_TYPE_TOP != "Other") |>
+  droplevels()
+
+contingency_tbl <- table(h2_data$ACCT_TYPE_TOP, h2_data$ACCOUNTSTATUS)
+
+cat("=== CONTINGENCY TABLE: Account Type × Account Status ===\n")
+print(contingency_tbl)
+
+cat("\n=== CHECK: Expected cell frequencies (must be ≥ 5 for chi-sq validity) ===\n")
+expected <- chisq.test(contingency_tbl)$expected
+cat("Minimum expected frequency:", round(min(expected), 2), "\n")
+cat("All cells ≥ 5:", all(expected >= 5), "\n")
+```
+
+### Step 2 — Run Chi-Squared Test
+
+```{r}
+#| label: h2-chisq
+#| message: false
+#| warning: false
+
+chi_result <- chisq.test(contingency_tbl)
+
+cat("=== CHI-SQUARED TEST OF INDEPENDENCE ===\n")
+print(chi_result)
+```
+
+### Step 3 — Calculate Cramér's V (Effect Size)
+
+```{r}
+#| label: h2-cramers
+#| message: false
+#| warning: false
+
+# Cramér's V = sqrt(chi2 / (n * (min(rows,cols) - 1)))
+n_obs   <- sum(contingency_tbl)
+k       <- min(nrow(contingency_tbl), ncol(contingency_tbl))
+cramers_v <- sqrt(chi_result$statistic / (n_obs * (k - 1)))
+
+cat("=== CRAMÉR'S V (Effect Size) ===\n")
+cat("Cramér's V:", round(cramers_v, 4), "\n\n")
+cat("Interpretation:\n")
+cat("  V < 0.10  = Negligible\n")
+cat("  V < 0.20  = Weak\n")
+cat("  V < 0.40  = Moderate\n")
+cat("  V >= 0.40 = Strong\n")
+```
+
+### Step 4 — Visualise the Association
+
+```{r}
+#| label: h2-visual
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 6
+
+# Pre-compute proportions first, then reorder by active rate separately
+h2_plot_data <- h2_data |>
+  count(ACCT_TYPE_TOP, ACCOUNTSTATUS) |>
+  group_by(ACCT_TYPE_TOP) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup()
+
+# Compute active rate per account type for ordering
+active_order <- h2_plot_data |>
+  filter(ACCOUNTSTATUS == "ACTIVE") |>
+  arrange(pct) |>
+  pull(ACCT_TYPE_TOP)
+
+h2_plot_data |>
+  mutate(ACCT_TYPE_TOP = factor(ACCT_TYPE_TOP, levels = active_order)) |>
+  ggplot(aes(x = ACCT_TYPE_TOP, y = pct, fill = ACCOUNTSTATUS)) +
+  geom_col(position = "stack", width = 0.65) +
+  geom_text(aes(label = if_else(pct > 0.02, percent(pct, accuracy = 0.1), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3, colour = "white", fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("ACTIVE"  = "#1A9641",
+                                "DORMANT" = "#FD8D3C",
+                                "CLOSED"  = "#D7191C")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 22)) +
+  labs(
+    title = "Hypothesis 2: Account Status Composition by Account Type",
+    subtitle = "Foreign Currency DOM accounts show highest dormancy — chi-squared association confirmed",
+    x = NULL, y = "Proportion of Accounts", fill = "Status"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+### Step 5 — Plain-Language Business Interpretation
+
+```{r}
+#| label: h2-interpretation
+#| results: asis
+
+cat("**Result:** The chi-squared test produces a statistically significant result
+(p < 0.05), allowing us to reject H₀. Account status is not independent of
+account type — certain account types are significantly more likely to be dormant
+or closed than others.\n\n")
+
+cat("**Effect size:** Cramér's V indicates the strength of this association.
+Even a weak-to-moderate V is meaningful at this sample size because it
+translates into hundreds of accounts behaving differently based solely on
+their product type.\n\n")
+
+cat("**Business implication:** Foreign Currency DOM accounts and certain
+current account types show disproportionate dormancy. This suggests a product-
+level onboarding problem — customers opening these accounts may not fully
+understand the activation requirements, minimum balance expectations, or use
+cases. The branch should introduce a product-specific onboarding checklist and
+a 30-day follow-up call for high-dormancy account types, rather than applying
+a single generic onboarding process to all new accounts.")
+```
+
+------------------------------------------------------------------------
+
+## 7.5 Bonus Hypothesis 3 — Did Balance Quality Differ Between 2024 and 2025 Cohorts?
+
+**H₀:** Mean log-balance is equal for accounts opened in 2024 vs 2025\
+**H₁:** Mean log-balance differs between the two cohorts\
+**Test:** Welch's t-test\
+**Rationale:** If onboarding quality deteriorated over time, newer cohorts would show lower balances — a critical strategic signal.
+
+```{r}
+#| label: h3-cohort
+#| message: false
+#| warning: false
+
+cohort_2024 <- df |>
+  filter(OPEN_YEAR == 2024, CRNT_BAL > 0) |>
+  pull(LOG_BALANCE)
+
+cohort_2025 <- df |>
+  filter(OPEN_YEAR == 2025, CRNT_BAL > 0) |>
+  pull(LOG_BALANCE)
+
+cat("=== COHORT SIZES ===\n")
+cat("2024 cohort (positive balance):", length(cohort_2024), "\n")
+cat("2025 cohort (positive balance):", length(cohort_2025), "\n\n")
+
+t_cohort <- t.test(cohort_2024, cohort_2025, var.equal = FALSE)
+print(t_cohort)
+
+# Effect size
+pooled_sd_c  <- sqrt((sd(cohort_2024)^2 + sd(cohort_2025)^2) / 2)
+cohens_d_c   <- (mean(cohort_2024) - mean(cohort_2025)) / pooled_sd_c
+cat("\nCohen's d (2024 vs 2025 cohort):", round(cohens_d_c, 4), "\n")
+```
+
+```{r}
+#| label: h3-visual
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 5
+
+df |>
+  filter(OPEN_YEAR %in% c(2024, 2025), CRNT_BAL > 0) |>
+  mutate(Cohort = factor(OPEN_YEAR)) |>
+  ggplot(aes(x = Cohort, y = LOG_BALANCE, fill = Cohort)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.12, fill = "white",
+               outlier.size = 0.6, outlier.alpha = 0.3) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 4, colour = "black") +
+  scale_fill_manual(values = c("2024" = "#2C7BB6", "2025" = "#FD8D3C")) +
+  labs(
+    title = "Hypothesis 3: Balance Quality — 2024 vs 2025 Opening Cohorts",
+    subtitle = "Diamond (◆) = group mean | Tests whether onboarding quality changed year-on-year",
+    x = "Account Opening Year", y = "log1p(Current Balance)",
+    fill = "Cohort"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r}
+#| label: h3-interpretation
+#| results: asis
+
+cat("**Business implication:** If the 2025 cohort shows significantly lower
+balances than the 2024 cohort, this is evidence that onboarding quality has
+declined — possibly due to pressure to hit account-opening volume targets at
+the expense of customer qualification. This finding should trigger a review
+of the marketer incentive structure and onboarding screening criteria.")
+```
+
+------------------------------------------------------------------------
+
+# 8. Correlation Analysis (Technique 4)
+
+## 8.1 Theory Recap
+
+Correlation analysis quantifies the strength and direction of linear relationships between variables. Pearson's r measures linear correlation between normally distributed continuous variables, ranging from -1 (perfect negative) to +1 (perfect perfect). Spearman's ρ is a rank-based alternative appropriate for skewed or ordinal data — it is more robust to outliers and non-normality. Kendall's τ is a third option used when sample sizes are small or tied ranks are numerous. Partial correlation extends this by measuring the relationship between two variables while controlling for the influence of a third — isolating the direct relationship from confounding. Correlation does not imply causation: a strong correlation between two variables may reflect a common cause, reverse causality, or coincidence.
+
+## 8.2 Business Justification
+
+As a Relationship Manager, understanding which account and customer characteristics move together is directly useful for portfolio management. If balance and restriction status are strongly negatively correlated, I know that flagging accounts early before restrictions are applied could preserve balance value. If age and account activity are correlated, I can segment my engagement effort by customer age band. Correlation analysis gives me a structured map of which variables are worth investigating further in regression — and which are redundant.
+
+## 8.3 Prepare Numeric Correlation Matrix
+
+```{r}
+#| label: corr-prepare
+#| message: false
+#| warning: false
+
+# Select numeric variables for correlation
+corr_df <- df |>
+  select(
+    CRNT_BAL,
+    AVAILABLE_BALANCE,
+    LOG_BALANCE,
+    AGE_CLEAN,
+    ACCOUNT_AGE_DAYS,
+    IS_ACTIVE,
+    IS_RESTRICTED,
+    HAS_BALANCE,
+    OPEN_YEAR
+  ) |>
+  drop_na()
+
+cat("=== CORRELATION MATRIX DATASET ===\n")
+cat("Observations used (complete cases):", nrow(corr_df), "\n")
+cat("Variables:", ncol(corr_df), "\n\n")
+
+# Rename for cleaner plot labels
+corr_df_labelled <- corr_df |>
+  rename(
+    `Current Bal`     = CRNT_BAL,
+    `Avail Bal`       = AVAILABLE_BALANCE,
+    `Log Balance`     = LOG_BALANCE,
+    `Age`             = AGE_CLEAN,
+    `Acct Age (days)` = ACCOUNT_AGE_DAYS,
+    `Is Active`       = IS_ACTIVE,
+    `Is Restricted`   = IS_RESTRICTED,
+    `Has Balance`     = HAS_BALANCE,
+    `Open Year`       = OPEN_YEAR
+  )
+```
+
+## 8.4 Pearson Correlation Matrix & Heatmap
+
+```{r}
+#| label: corr-pearson
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+
+pearson_mat <- cor(corr_df_labelled, method = "pearson", use = "complete.obs")
+
+cat("=== PEARSON CORRELATION MATRIX ===\n")
+round(pearson_mat, 3) |>
+  kable(caption = "Table 4: Pearson Correlation Matrix") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 11, full_width = FALSE)
+```
+
+```{r}
+#| label: corr-pearson-heatmap
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+
+ggcorrplot(
+  pearson_mat,
+  method    = "square",
+  type      = "lower",
+  lab       = TRUE,
+  lab_size  = 3.2,
+  colors    = c("#D7191C", "white", "#1A9641"),
+  title     = "Pearson Correlation Heatmap",
+  ggtheme   = theme_minimal(base_size = 11),
+  outline.color = "white"
+) +
+  labs(subtitle = "Lower triangle only | Red = negative, Green = positive correlation") +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## 8.5 Spearman Correlation — Robustness Check for Skewed Variables
+
+```{r}
+#| label: corr-spearman
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+
+spearman_mat <- cor(corr_df_labelled, method = "spearman", use = "complete.obs")
+
+cat("=== SPEARMAN CORRELATION MATRIX ===\n")
+round(spearman_mat, 3) |>
+  kable(caption = "Table 5: Spearman Correlation Matrix (rank-based, robust to skew)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                font_size = 11, full_width = FALSE)
+```
+
+```{r}
+#| label: corr-spearman-heatmap
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+
+ggcorrplot(
+  spearman_mat,
+  method    = "square",
+  type      = "lower",
+  lab       = TRUE,
+  lab_size  = 3.2,
+  colors    = c("#D7191C", "white", "#1A9641"),
+  title     = "Spearman Correlation Heatmap (Rank-Based)",
+  ggtheme   = theme_minimal(base_size = 11),
+  outline.color = "white"
+) +
+  labs(subtitle = "More appropriate for CRNT_BAL and LOG_BALANCE which are heavily right-skewed") +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey40"))
+```
+
+## 8.6 Pearson vs Spearman Comparison
+
+```{r}
+#| label: corr-comparison
+#| message: false
+#| warning: false
+
+# Compare key pairs between Pearson and Spearman
+key_pairs <- list(
+  c("Current Bal",     "Avail Bal"),
+  c("Log Balance",     "Is Active"),
+  c("Is Restricted",   "Is Active"),
+  c("Has Balance",     "Is Active"),
+  c("Age",             "Is Active"),
+  c("Log Balance",     "Is Restricted"),
+  c("Acct Age (days)", "Is Active"),
+  c("Open Year",       "Is Active")
+)
+
+comparison_tbl <- map_dfr(key_pairs, function(pair) {
+  tibble(
+    Variable_1 = pair[1],
+    Variable_2 = pair[2],
+    Pearson_r  = round(pearson_mat[pair[1], pair[2]], 4),
+    Spearman_p = round(spearman_mat[pair[1], pair[2]], 4),
+    Difference = round(abs(pearson_mat[pair[1], pair[2]] -
+                             spearman_mat[pair[1], pair[2]]), 4)
+  )
+})
+
+comparison_tbl |>
+  kable(
+    caption = "Table 6: Pearson vs Spearman — Key Variable Pairs",
+    col.names = c("Variable 1", "Variable 2",
+                  "Pearson r", "Spearman ρ", "|Difference|")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  row_spec(
+    which(comparison_tbl$Difference > 0.05),
+    background = "#FFF3CD",
+    bold = TRUE
+  )
+```
+
+## 8.7 Partial Correlation — Controlling for Account Age
+
+```{r}
+#| label: corr-partial
+#| message: false
+#| warning: false
+
+# Partial correlation: IS_ACTIVE ~ LOG_BALANCE, controlling for ACCOUNT_AGE_DAYS
+# Method: residualise both variables on the control, then correlate residuals
+
+control_var  <- corr_df$ACCOUNT_AGE_DAYS
+outcome_var  <- corr_df$IS_ACTIVE
+predictor_var <- corr_df$LOG_BALANCE
+
+resid_outcome   <- residuals(lm(outcome_var   ~ control_var))
+resid_predictor <- residuals(lm(predictor_var ~ control_var))
+
+partial_r   <- cor(resid_outcome, resid_predictor, method = "pearson")
+partial_rho <- cor(resid_outcome, resid_predictor, method = "spearman")
+
+cat("=== PARTIAL CORRELATION ===\n")
+cat("Relationship: IS_ACTIVE ~ LOG_BALANCE, controlling for ACCOUNT_AGE_DAYS\n\n")
+cat("Zero-order Pearson r (unadjusted):  ",
+    round(pearson_mat["Is Active", "Log Balance"], 4), "\n")
+cat("Partial Pearson r (age-controlled): ",
+    round(partial_r, 4), "\n\n")
+cat("Zero-order Spearman ρ (unadjusted): ",
+    round(spearman_mat["Is Active", "Log Balance"], 4), "\n")
+cat("Partial Spearman ρ (age-controlled):",
+    round(partial_rho, 4), "\n\n")
+cat("Interpretation: If partial r differs substantially from zero-order r,\n")
+cat("account age confounds the balance-activity relationship.\n")
+cat("If they are similar, the relationship is direct and not age-driven.\n")
+```
+
+## 8.8 Top Correlations — Business Interpretation
+
+```{r}
+#| label: corr-top3
+#| message: false
+#| warning: false
+
+tibble(
+  Rank = 1:5,
+  Pair = c(
+    "Current Balance ↔ Available Balance",
+    "Log Balance ↔ Has Balance",
+    "Is Restricted ↔ Is Active",
+    "Log Balance ↔ Is Active",
+    "Has Balance ↔ Is Active"
+  ),
+  Pearson_r = c(
+    round(pearson_mat["Current Bal", "Avail Bal"], 3),
+    round(pearson_mat["Log Balance", "Has Balance"], 3),
+    round(pearson_mat["Is Restricted", "Is Active"], 3),
+    round(pearson_mat["Log Balance", "Is Active"], 3),
+    round(pearson_mat["Has Balance", "Is Active"], 3)
+  ),
+  Business_Meaning = c(
+    "Near-perfect — AVAILABLE_BALANCE and CRNT_BAL are collinear. Use only one in regression to avoid multicollinearity.",
+    "Strong positive — accounts with any balance are far more likely to show higher log balances. Trivially true but confirms HAS_BALANCE is a valid binary proxy.",
+    "Negative — restricted accounts are significantly less likely to be active. Restriction status is an early warning signal for dormancy and closure.",
+    "Positive — higher balance accounts are more likely to remain active. Balance at opening may predict long-term account health.",
+    "Positive — accounts that were ever funded are substantially more likely to remain active. First deposit is the single most critical onboarding milestone."
+  )
+) |>
+  kable(
+    caption = "Table 7: Top 5 Correlations and Business Implications",
+    col.names = c("Rank", "Variable Pair", "Pearson r", "Business Meaning")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = TRUE) |>
+  column_spec(4, width = "45%")
+```
+
+## 8.9 Correlation vs Causation — Critical Note
+
+```{r}
+#| label: corr-causation
+#| results: asis
+
+cat("**Critical methodological note:** The strong negative correlation between
+restriction status and account activity does not prove that restrictions *cause*
+dormancy. The causal direction could plausibly run either way — restrictions may
+be applied *because* accounts are already inactive, or restrictions may *trigger*
+inactivity by blocking transactions. Equally, a third variable (customer
+financial distress, fraud flags, or KYC non-compliance) could drive both
+restriction and dormancy simultaneously. Confirming causality would require a
+controlled intervention — for example, tracking whether accounts that had
+restrictions lifted subsequently recovered activity at a higher rate than
+unrestricted dormant accounts. This is flagged as a direction for further work
+in Section 11.")
+```
+
+------------------------------------------------------------------------
+
+# 9. Logistic Regression (Technique 5)
+
+## 9.1 Theory Recap
+
+Logistic regression models the probability that a binary outcome equals 1 given a set of predictor variables. Unlike linear regression, it uses the logit link function to constrain predicted probabilities between 0 and 1. The model estimates log-odds coefficients (β) for each predictor; exponentiating these gives odds ratios (OR), which are more interpretable: an OR \> 1 means the predictor increases the odds of the outcome, OR \< 1 means it decreases them. Model fit is assessed through the confusion matrix, ROC curve, and AUC (Area Under the Curve) — a threshold-independent measure of discriminative ability where 0.5 = random chance and 1.0 = perfect classification. The Hosmer-Lemeshow test checks calibration — whether predicted probabilities match observed outcomes across probability deciles. Variance Inflation Factor (VIF) detects multicollinearity among predictors; values above 5 are concerning, above 10 are severe.
+
+## 9.2 Business Justification
+
+Predicting which newly opened accounts are at risk of becoming dormant or closed — before it happens — is the central retention challenge for a Relationship Manager. A logistic regression model that assigns each account a probability of remaining active, based on observable characteristics at the point of opening, enables proactive rather than reactive engagement. Instead of waiting for an account to go dormant and then attempting recovery, the branch can flag high-risk accounts within the first 30 days and trigger a structured intervention. This transforms account management from a reactive administrative function into a predictive relationship strategy.
+
+## 9.3 Data Preparation for Modelling
+
+```{r}
+#| label: logit-prep
+#| message: false
+#| warning: false
+
+# Build modelling dataset — select predictors, drop NA rows
+model_df <- df |>
+  select(
+    IS_ACTIVE,
+    LOG_BALANCE,
+    AGE_CLEAN,
+    ACCOUNT_AGE_DAYS,
+    CUSTOMER_TYPE,
+    ACCT_TYPE_TOP,
+    IS_RESTRICTED,
+    HAS_BALANCE,
+    OPEN_YEAR,
+    DEPOSITOR_TOP
+  ) |>
+  drop_na()
+
+cat("=== MODELLING DATASET ===\n")
+cat("Complete cases for modelling:", nrow(model_df), "\n")
+cat("Outcome distribution:\n")
+print(table(model_df$IS_ACTIVE))
+cat("Active rate:", round(mean(model_df$IS_ACTIVE) * 100, 2), "%\n\n")
+
+# Note AVAILABLE_BALANCE excluded — near-perfect collinearity with CRNT_BAL
+cat("NOTE: AVAILABLE_BALANCE excluded — Pearson r > 0.99 with CRNT_BAL.\n")
+cat("Using LOG_BALANCE only to avoid multicollinearity.\n")
+```
+
+## 9.4 Train / Test Split
+
+```{r}
+#| label: logit-split
+#| message: false
+#| warning: false
+
+set.seed(42)
+
+n_total <- nrow(model_df)
+train_idx <- sample(seq_len(n_total), size = floor(0.70 * n_total))
+
+train_df <- model_df[ train_idx, ]
+test_df  <- model_df[-train_idx, ]
+
+cat("=== TRAIN / TEST SPLIT (70 / 30) ===\n")
+cat("Training set:", nrow(train_df), "observations\n")
+cat("Test set:    ", nrow(test_df),  "observations\n\n")
+cat("Training active rate:", round(mean(train_df$IS_ACTIVE) * 100, 2), "%\n")
+cat("Test active rate:    ", round(mean(test_df$IS_ACTIVE)  * 100, 2), "%\n")
+```
+
+## 9.5 Fit Logistic Regression Model
+
+```{r}
+#| label: logit-fit
+#| message: false
+#| warning: false
+
+logit_model <- glm(
+  IS_ACTIVE ~ LOG_BALANCE + AGE_CLEAN + ACCOUNT_AGE_DAYS +
+              CUSTOMER_TYPE + ACCT_TYPE_TOP + IS_RESTRICTED +
+              HAS_BALANCE + OPEN_YEAR + DEPOSITOR_TOP,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+
+cat("=== MODEL SUMMARY ===\n")
+summary(logit_model)
+```
+
+## 9.6 Multicollinearity Check — Variance Inflation Factor
+
+```{r}
+#| label: logit-vif
+#| message: false
+#| warning: false
+
+vif_vals <- vif(logit_model)
+
+vif_tbl <- as.data.frame(vif_vals) |>
+  rownames_to_column("Variable") |>
+  arrange(desc(GVIF))
+
+vif_tbl |>
+  kable(
+    caption = "Table 8: Variance Inflation Factors (VIF) — Multicollinearity Check",
+    digits = 3
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  row_spec(which(vif_tbl$GVIF > 5), background = "#FFE4E4", bold = TRUE)
+
+cat("\nInterpretation: GVIF > 5 flagged in red — consider removing or combining.\n")
+cat("GVIF > 10 = severe multicollinearity requiring action.\n")
+```
+
+## 9.7 Odds Ratios — Model Coefficients
+
+```{r}
+#| label: logit-or
+#| message: false
+#| warning: false
+
+or_tbl <- tidy(logit_model, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Significant = if_else(p.value < 0.05, "Yes", "No"),
+    OR_label    = paste0(round(estimate, 3),
+                         " [", round(conf.low, 3),
+                         " – ", round(conf.high, 3), "]")
+  ) |>
+  select(term, OR_label, p.value, Significant) |>
+  arrange(p.value)
+
+or_tbl |>
+  kable(
+    caption = "Table 9: Odds Ratios with 95% Confidence Intervals",
+    col.names = c("Predictor", "OR [95% CI]", "p-value", "Significant (p<0.05)")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  row_spec(which(or_tbl$Significant == "Yes"), background = "#E8F5E9", bold = TRUE)
+```
+
+```{r}
+#| label: logit-or-plot
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 7
+
+# Forest plot of odds ratios
+or_plot_data <- tidy(logit_model, exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    term        = str_replace_all(term, "ACCT_TYPE_TOP|CUSTOMER_TYPE|DEPOSITOR_TOP", ""),
+    term        = str_wrap(term, width = 30),
+    Significant = if_else(p.value < 0.05, "Significant", "Not significant")
+  )
+
+ggplot(or_plot_data,
+       aes(x = estimate,
+           y = fct_reorder(term, estimate),
+           colour = Significant)) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             colour = "grey50", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.25, linewidth = 0.7) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("Significant"     = "#1A9641",
+                                  "Not significant" = "#AAAAAA")) +
+  scale_x_log10() +
+  labs(
+    title    = "Logistic Regression — Odds Ratio Forest Plot",
+    subtitle = "OR > 1: increases odds of being ACTIVE | OR < 1: decreases odds | Dashed line = OR of 1 (no effect)",
+    x        = "Odds Ratio (log scale)",
+    y        = NULL,
+    colour   = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+## 9.8 Model Diagnostics
+
+### Hosmer-Lemeshow Goodness-of-Fit Test
+
+```{r}
+#| label: logit-hl
+#| message: false
+#| warning: false
+
+# Manual Hosmer-Lemeshow test (10 groups)
+train_preds <- predict(logit_model, type = "response")
+
+hl_df <- tibble(
+  predicted = train_preds,
+  observed  = train_df$IS_ACTIVE
+) |>
+  mutate(decile = ntile(predicted, 10)) |>
+  group_by(decile) |>
+  summarise(
+    n          = n(),
+    obs_active = sum(observed),
+    exp_active = sum(predicted),
+    obs_inact  = n - obs_active,
+    exp_inact  = n - exp_active
+  )
+
+hl_stat <- sum(
+  (hl_df$obs_active - hl_df$exp_active)^2 / hl_df$exp_active +
+  (hl_df$obs_inact  - hl_df$exp_inact)^2  / hl_df$exp_inact
+)
+hl_pval <- pchisq(hl_stat, df = 8, lower.tail = FALSE)
+
+cat("=== HOSMER-LEMESHOW TEST ===\n")
+cat("H₀: Predicted probabilities are well-calibrated to observed outcomes\n")
+cat("HL Statistic:", round(hl_stat, 4), "\n")
+cat("Degrees of freedom: 8\n")
+cat("p-value:", round(hl_pval, 4), "\n\n")
+cat("Interpretation: p > 0.05 = no evidence of poor fit (model is well-calibrated)\n")
+cat("                p < 0.05 = model predictions deviate from observed outcomes\n")
+
+hl_df |>
+  kable(
+    caption = "Table 10: Hosmer-Lemeshow Decile Table",
+    digits  = 2,
+    col.names = c("Decile", "N", "Obs Active",
+                  "Exp Active", "Obs Inactive", "Exp Inactive")
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+### ROC Curve & AUC
+
+```{r}
+#| label: logit-roc
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 6
+
+# Predict on TEST set
+test_probs <- predict(logit_model, newdata = test_df, type = "response")
+
+roc_obj <- roc(test_df$IS_ACTIVE, test_probs, quiet = TRUE)
+auc_val <- auc(roc_obj)
+
+# Plot ROC
+roc_df <- tibble(
+  specificity = roc_obj$specificities,
+  sensitivity = roc_obj$sensitivities
+)
+
+ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(colour = "#2C7BB6", linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.65, y = 0.15,
+           label = paste0("AUC = ", round(auc_val, 4)),
+           size = 5, fontface = "bold", colour = "#2C7BB6") +
+  labs(
+    title    = "ROC Curve — Logistic Regression (Test Set)",
+    subtitle = "AUC closer to 1.0 = better discriminative ability | 0.5 = random chance",
+    x        = "1 - Specificity (False Positive Rate)",
+    y        = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 12)
+
+cat("=== AUC RESULT ===\n")
+cat("AUC:", round(auc_val, 4), "\n")
+cat("Interpretation:\n")
+cat("  AUC 0.50–0.60: Poor\n")
+cat("  AUC 0.60–0.70: Fair\n")
+cat("  AUC 0.70–0.80: Acceptable\n")
+cat("  AUC 0.80–0.90: Excellent\n")
+cat("  AUC 0.90–1.00: Outstanding\n")
+```
+
+### Confusion Matrix
+
+```{r}
+#| label: logit-confusion
+#| message: false
+#| warning: false
+
+# Classify at 0.5 threshold
+test_preds <- if_else(test_probs >= 0.5, 1L, 0L)
+
+conf_mat <- table(
+  Predicted = test_preds,
+  Actual    = test_df$IS_ACTIVE
+)
+
+cat("=== CONFUSION MATRIX (threshold = 0.50) ===\n")
+print(conf_mat)
+
+# Derived metrics
+TP <- conf_mat[2, 2]
+TN <- conf_mat[1, 1]
+FP <- conf_mat[2, 1]
+FN <- conf_mat[1, 2]
+
+accuracy    <- (TP + TN) / sum(conf_mat)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+precision   <- TP / (TP + FP)
+f1          <- 2 * precision * sensitivity / (precision + sensitivity)
+
+cat("\n=== PERFORMANCE METRICS ===\n")
+tibble(
+  Metric      = c("Accuracy", "Sensitivity (Recall)",
+                  "Specificity", "Precision", "F1 Score"),
+  Value       = round(c(accuracy, sensitivity,
+                         specificity, precision, f1), 4),
+  Meaning     = c(
+    "Overall correct classification rate",
+    "Of all truly active accounts, % correctly identified",
+    "Of all truly inactive accounts, % correctly identified",
+    "Of predicted active, % actually active",
+    "Harmonic mean of precision and sensitivity"
+  )
+) |>
+  kable(caption = "Table 11: Confusion Matrix Derived Metrics") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 9.9 Business Interpretation of Key Coefficients
+
+```{r}
+#| label: logit-interpret
+#| results: asis
+
+cat("### Reading the Model Output\n\n")
+
+cat("The logistic regression model produces odds ratios for each predictor.
+Below are the five most actionable findings for branch management:\n\n")
+
+cat("**1. IS_RESTRICTED (PND Status):** Accounts with any payment restriction
+(debit restriction or total block) have substantially lower odds of remaining
+active. This is the strongest behavioural predictor in the model. Operationally,
+a restriction flag should trigger an immediate Relationship Manager call — not
+a letter, not a system notification. The window between restriction and full
+dormancy is narrow.\n\n")
+
+cat("**2. LOG_BALANCE:** Higher balance at the time of the extract is positively
+associated with active status. This confirms what practitioners know intuitively
+but the model now quantifies: accounts that were funded — even partially — are
+dramatically more likely to remain active. The single most important onboarding
+milestone is the first deposit. The branch should track 'time to first deposit'
+as a KPI for every new account, targeting completion within 7 days of opening.\n\n")
+
+cat("**3. HAS_BALANCE:** Accounts with any balance at all (binary flag) show
+higher odds of being active even after controlling for the log-transformed
+balance amount. This means it is not just the size of the balance that matters
+— the mere fact of having been funded at all is independently predictive.
+Zero-balance accounts at 30 days should be treated as dormancy-in-progress.\n\n")
+
+cat("**4. CUSTOMER_TYPE (INDIVIDUAL vs CORPORATE):** After controlling for
+balance and restriction status, customer type remains a significant predictor.
+Corporate accounts exhibit different activity patterns than individual accounts.
+This justifies maintaining separate onboarding and engagement protocols for
+the two segments rather than a one-size-fits-all approach.\n\n")
+
+cat("**5. ACCOUNT_AGE_DAYS:** Older accounts (those opened earlier in the
+observation window) are more likely to be active, which partly reflects
+survivorship — accounts that opened in 2024 and are still active in April 2026
+have proven their persistence. However, this also suggests that newer accounts
+(opened late 2025 or 2026) are at higher risk of early exit and deserve
+proportionally more intensive early-stage engagement.")
+```
+
+## 9.10 Model Deployment Recommendation
+
+```{r}
+#| label: logit-deployment
+#| results: asis
+
+cat("### Which Model and Why?\n\n")
+
+cat("This single logistic regression model is recommended for immediate
+operational deployment over more complex alternatives (random forest, XGBoost)
+for three reasons specific to this banking context:\n\n")
+
+cat("**Interpretability:** Branch management and compliance teams require
+explainable predictions. A Relationship Manager cannot act on a black-box
+score — they need to know *why* an account is flagged as high-risk. Logistic
+regression provides exact odds ratios for every predictor, making every
+prediction auditable.\n\n")
+
+cat("**Regulatory compatibility:** Nigerian banking regulation (CBN guidelines)
+requires that credit and risk decisions be explainable to customers and
+auditors. A logistic regression satisfies this requirement; ensemble models
+typically do not without additional explainability tooling.\n\n")
+
+cat("**Practical deployment:** The model requires only variables available at
+account opening — customer type, account type, depositor type, and opening
+year — plus early indicators available within 30 days (balance funded, restriction
+status). It can be operationalised as a simple scoring spreadsheet or embedded
+in the core banking MIS without specialist infrastructure.\n\n")
+
+cat("**Recommended operating threshold:** 0.50 (default). Given the 93.6%
+active rate in this dataset, the model is conservative by design — it will
+flag fewer false positives, protecting relationship quality. If the branch
+wants to cast a wider net and catch more at-risk accounts at the cost of
+more false positives, lower the threshold to 0.35–0.40.")
+```
+
+------------------------------------------------------------------------
+
+# 10. Integrated Findings
+
+## 10.1 How the Five Analyses Fit Together
+
+The five analytical techniques applied in this study were not conducted in isolation — each builds on the previous and collectively answers a single overarching business question: **what determines whether a newly opened account at the Providus Bank Port Harcourt Branch remains active, and what should the branch do about it?**
+
+**Exploratory Data Analysis** established the foundation. The branch opened 14,714 accounts between January 2024 and April 2026, dominated by individual savings accounts (57.9%) and marketer-driven acquisition (40.6% of depositor types). The balance distribution is severely right-skewed — the median balance is approximately ₦826, while the mean is over ₦1 million — confirming that a small number of high-value accounts mask a large volume of unfunded or near-zero accounts. Two data quality issues were identified and resolved: age outliers (impossible values below 0 and above 100) and systematic high missingness in five columns. The Anscombe demonstration confirmed that summary statistics alone would have given branch management a dangerously misleading picture of portfolio health.
+
+**Data Visualisation** translated these patterns into a coherent narrative across five plots. Monthly openings peaked in January 2025 and declined through 2025, suggesting acquisition momentum has slowed. Corporate accounts show disproportionately higher dormancy relative to their volume. Savings accounts cluster overwhelmingly at zero balance. Closed and dormant accounts skew towards customers under 30. And the marketer channel dominates acquisition so completely that portfolio quality is structurally dependent on marketer incentive design.
+
+**Hypothesis Testing** validated three critical assumptions with statistical rigour. Corporate accounts hold significantly higher balances than individual accounts (Welch's t-test, p \< 0.05; Cohen's d indicating a meaningful effect size) — confirming that corporate onboarding quality deserves disproportionate management attention. Account status is significantly associated with account type (chi-squared, p \< 0.05; Cramér's V quantifying the strength) — meaning product-specific onboarding protocols are justified, not optional. The 2024 vs 2025 cohort comparison tested whether onboarding quality has drifted over time — a finding with direct implications for the marketer incentive structure.
+
+**Correlation Analysis** mapped the relationship landscape. The strongest actionable finding was the negative correlation between restriction status and account activity — restricted accounts are significantly less likely to remain active, and this relationship persists after controlling for account age via partial correlation. The near-perfect collinearity between CRNT_BAL and AVAILABLE_BALANCE was identified and handled correctly by excluding the latter from regression. The comparison between Pearson and Spearman correlations confirmed that skew in the balance variable materially affects correlation estimates, validating the decision to use log-transformation throughout.
+
+**Logistic Regression** synthesised all prior findings into a predictive model. Tested on a held-out 30% sample, the model achieves meaningful discriminative ability (AUC reported in Section 9.8). The five most actionable predictors — restriction status, log balance, having any balance at all, customer type, and account age — provide a clear operational playbook. The model is interpretable, auditable, and deployable within existing branch infrastructure without specialist tooling.
+
+## 10.2 Single Integrated Recommendation
+
+```{r}
+#| label: recommendation
+#| results: asis
+
+cat("The five analyses collectively support one central recommendation:\n\n")
+
+cat("**Implement a structured 30-60-90 day post-onboarding engagement
+protocol, differentiated by account type and customer segment.**\n\n")
+
+cat("Specifically:\n\n")
+
+cat("- **Day 7:** Automated check — has the account received its first deposit?
+  Zero-balance accounts at Day 7 should trigger a Relationship Manager call,
+  not a system-generated SMS. The model confirms that the mere fact of being
+  funded — regardless of amount — is the single strongest early predictor of
+  long-term account activity.\n\n")
+
+cat("- **Day 30:** Restriction status review. Any account with a PND flag at
+  Day 30 should be escalated immediately. The correlation and regression analyses
+  both confirm that restriction status is the most powerful predictor of
+  dormancy — and the window for intervention is narrow.\n\n")
+
+cat("- **Day 60:** Segment-specific engagement. Corporate accounts showing
+  low balance at Day 60 should receive a dedicated Relationship Manager review
+  given their disproportionate balance contribution. Individual savings accounts
+  at zero balance at Day 60 should be flagged for a lighter-touch digital
+  re-engagement campaign.\n\n")
+
+cat("- **Day 90:** Dormancy risk scoring. Apply the logistic regression model
+  to score all accounts opened in the preceding quarter. Accounts with predicted
+  active probability below 0.50 should be prioritised for the next relationship
+  management cycle.\n\n")
+
+cat("This protocol addresses the root cause identified across all five analyses:
+the branch currently treats all newly opened accounts identically after opening,
+regardless of funding status, restriction flags, customer type, or product type.
+The data shows clearly that these variables have materially different implications
+for account survival — and the branch's engagement model should reflect that.")
+```
+
+------------------------------------------------------------------------
+
+# 11. Limitations & Further Work
+
+```{r}
+#| label: limitations
+#| results: asis
+
+cat("## 11.1 Data Limitations\n\n")
+
+cat("**Single branch:** All 14,714 accounts are from the Port Harcourt Branch
+only. Findings may not generalise to other Providus Bank branches operating
+in different economic environments, customer demographics, or SBU structures.
+A multi-branch dataset would allow branch-level fixed effects and substantially
+stronger generalisability.\n\n")
+
+cat("**Cross-sectional snapshot:** The dataset captures account status and
+balance at a single point in time (April 2026). It does not contain transaction
+history, balance trajectories over time, or the sequence of events leading to
+dormancy or closure. A longitudinal extract — monthly balance snapshots over
+the 28-month window — would enable survival analysis and time-to-dormancy
+modelling, which would be far more powerful than the static logistic regression
+applied here.\n\n")
+
+cat("**High missingness in key variables:** RELIGION (62.7% missing), TELL_NAME
+(45.5%), and TELEPHONE1 (37.8%) could not be meaningfully used in analysis.
+The causes of missingness are unknown — it may be systematic (certain account
+types not requiring these fields) rather than random, which could bias
+conclusions drawn from the complete-case analysis.\n\n")
+
+cat("**Class imbalance:** The outcome variable IS_ACTIVE is 93.6% positive.
+While logistic regression handles this, the model's ability to correctly
+identify the minority class (inactive accounts) is constrained. With more
+data, techniques such as SMOTE oversampling or cost-sensitive learning could
+improve minority-class prediction — which is precisely the class the branch
+most needs to identify correctly.\n\n")
+
+cat("## 11.2 Methodological Limitations\n\n")
+
+cat("**Correlation is not causation:** The correlation and regression findings
+establish association, not causality. The relationship between restriction
+status and dormancy, for example, could reflect reverse causality — restrictions
+may be applied to already-inactive accounts rather than causing inactivity.
+A randomised or quasi-experimental design (e.g., difference-in-differences
+comparing accounts before and after a policy change) would be required to
+establish causality.\n\n")
+
+cat("**Logistic regression assumptions:** The model assumes a linear
+relationship between continuous predictors and the log-odds of the outcome.
+This assumption was not formally tested for all predictors. Non-linear
+extensions (polynomial terms, spline regression) may improve fit, particularly
+for AGE_CLEAN and ACCOUNT_AGE_DAYS where non-linear effects are plausible.\n\n")
+
+cat("## 11.3 What Would Be Done Differently With More Resources\n\n")
+
+cat("With access to full transaction history, a **survival analysis
+(Cox proportional-hazards model)** would replace logistic regression as
+the primary technique — modelling time-to-dormancy rather than static
+active status, and accounting for censoring (accounts still active at the
+observation cutoff). With a multi-branch dataset, **multilevel modelling**
+would separate within-branch effects from between-branch variation. With
+more computing power and a labelled historical dataset of intervention
+outcomes, a **reinforcement learning** approach could optimise the engagement
+protocol in real time based on observed customer responses.")
+```
+
+------------------------------------------------------------------------
+
+# References
+
+```{r}
+#| label: references
+#| results: asis
+
+cat("Adi, B. (2026). *AI-powered business analytics: A practical textbook for
+data-driven decision making — from data fundamentals to machine learning in
+Python and R.* Lagos Business School / markanalytics.online.
+https://markanalytics.online\n\n")
+
+cat("Anscombe, F. J. (1973). Graphs in statistical analysis. *The American
+Statistician, 27*(1), 17–21. https://doi.org/10.1080/00031305.1973.10478966\n\n")
+
+cat("R Core Team. (2026). *R: A language and environment for statistical
+computing* (Version 4.6.0). R Foundation for Statistical Computing.
+https://www.R-project.org/\n\n")
+
+cat("Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L., François, R.,
+Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T. L.,
+Miller, E., Bache, S. M., Müller, K., Ooms, J., Robinson, D., Seidel, D. P.,
+Spinu, V., … Yutani, H. (2019). Welcome to the tidyverse. *Journal of Open
+Source Software, 4*(43), 1686. https://doi.org/10.21105/joss.01686\n\n")
+
+cat("Wickham, H. (2016). *ggplot2: Elegant graphics for data analysis.*
+Springer. https://doi.org/10.1007/978-3-319-24277-4\n\n")
+
+cat("Robin, X., Turck, N., Hainard, A., Tiberti, N., Lisacek, F., Sanchez,
+J.-C., & Müller, M. (2011). pROC: An open-source package for R and S+ to
+analyze and compare ROC curves. *BMC Bioinformatics, 12*, 77.
+https://doi.org/10.1186/1471-2105-12-77\n\n")
+
+cat("Fox, J., & Weisberg, S. (2019). *An R companion to applied regression*
+(3rd ed.). Sage. [car package]\n\n")
+
+cat("Grolemund, G., & Wickham, H. (2011). Dates and times made easy with
+lubridate. *Journal of Statistical Software, 40*(3), 1–25.
+https://doi.org/10.18637/jss.v040.i03\n\n")
+
+cat("Tierney, N., & Cook, D. (2023). Expanding tidy data principles to
+facilitate missing data exploration, visualization and assessment of
+imputations. *Journal of Statistical Software, 105*(7), 1–31.
+https://doi.org/10.18637/jss.v105.i07 [naniar package]\n\n")
+
+cat("Zhu, H. (2024). *kableExtra: Construct complex table with 'kable' and
+pipe syntax.* https://CRAN.R-project.org/package=kableExtra\n\n")
+```
+
+```{r}
+#| label: package-citations
+#| message: false
+#| warning: false
+
+# Programmatically retrieve package citations for accuracy
+pkgs <- c("tidyverse", "lubridate", "janitor", "skimr",
+          "corrplot", "ggcorrplot", "naniar", "car",
+          "lmtest", "broom", "pROC", "knitr",
+          "kableExtra", "scales", "reticulate")
+
+cat("=== PACKAGE VERSIONS USED ===\n")
+for (pkg in pkgs) {
+  ver <- tryCatch(
+    as.character(packageVersion(pkg)),
+    error = function(e) "not installed"
+  )
+  cat(sprintf("%-15s v%s\n", pkg, ver))
+}
+```
+
+------------------------------------------------------------------------
+
+# Appendix: AI Usage Statement
+
+```{r}
+#| label: ai-statement
+#| results: asis
+
+cat("Claude (Anthropic, claude.ai) was used as a coding assistant throughout
+this project. Specifically, AI assistance was used to: (1) generate initial
+R code scaffolding for ggplot2 visualisations and logistic regression
+diagnostics; (2) debug rendering errors in the Quarto document; and (3)
+suggest appropriate chunk options and table formatting syntax.\n\n")
+
+cat("All analytical decisions were made independently by the author. These
+include: the choice of Case Study 1 and the five techniques applied; the
+framing of the three research hypotheses and their business interpretation;
+the decision to use Welch's t-test over Student's t-test following the
+Levene test result; the selection of predictor variables for the logistic
+regression model and the exclusion of AVAILABLE_BALANCE due to collinearity;
+the interpretation of all model outputs; and the integrated recommendation
+in Section 10. The author can explain and defend every analytical choice,
+every line of code, and every conclusion drawn in this document.\n\n")
+
+cat("Data collection, anonymisation, and the professional disclosure were
+authored entirely without AI assistance.")
+```
